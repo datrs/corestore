@@ -1,6 +1,6 @@
 use delegate::delegate;
+use hypercore::Hypercore;
 use hypercore_protocol::DiscoveryKey;
-use replicator::ReplicatingCore;
 use std::sync::Arc;
 
 use crate::{
@@ -9,7 +9,7 @@ use crate::{
     storage::StorageKind,
     CoreCache, Corestore, Error, PrimaryKey, Result,
 };
-use hypercore::{replication::CoreInfo, PartialKeypair, VerifyingKey};
+use hypercore::{PartialKeypair, VerifyingKey};
 use tokio::sync::{broadcast::Receiver, RwLock};
 
 #[derive(Debug, derive_builder::Builder)]
@@ -49,7 +49,7 @@ impl CorestoreBuilder {
             events: Default::default(),
         };
         for existing_core in cs.storage.load_existing_cores().await? {
-            let vk = existing_core.key_pair().await.public;
+            let vk = existing_core.key_pair().public;
             cs.insert_core_into_cache(vk, existing_core);
         }
         Ok(Corestore {
@@ -72,8 +72,8 @@ impl InnerCorstore {
     fn insert_core_into_cache(
         &mut self,
         vk: VerifyingKey,
-        core: ReplicatingCore,
-    ) -> Option<ReplicatingCore> {
+        core: Hypercore,
+    ) -> Option<Hypercore> {
         self.core_cache.insert(&vk, core.clone())
     }
 
@@ -81,7 +81,7 @@ impl InnerCorstore {
     /// This does... not? work if there is no verifying key.
     /// Or, maybe, all cores get a primary key, but only writable cores use this?
     /// This would imply that a corestore instance could have mixed readable and writable keys...
-    pub async fn get_from_name(&mut self, name: &str) -> Result<ReplicatingCore> {
+    pub async fn get_from_name(&mut self, name: &str) -> Result<Hypercore> {
         let kp = key_pair_from_name(self.primary_key, &DEFAULT_NAMESPACE, name)?;
 
         if let Some(core) = self.core_cache.get(&kp.public) {
@@ -98,7 +98,7 @@ impl InnerCorstore {
     pub async fn get_from_verifying_key(
         &mut self,
         verifying_key: &VerifyingKey,
-    ) -> Result<ReplicatingCore> {
+    ) -> Result<Hypercore> {
         if let Some(core) = self.core_cache.get(verifying_key) {
             return Ok(core);
         };

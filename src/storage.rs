@@ -3,10 +3,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use hypercore::{HypercoreBuilder, PartialKeypair, Storage, VerifyingKey};
+use hypercore::{Hypercore, HypercoreBuilder, PartialKeypair, Storage, VerifyingKey};
 use hypercore_protocol::discovery_key;
 use rand::{rngs::OsRng, RngCore};
-use replicator::ReplicatingCore;
 use tracing::error;
 
 use crate::{Error, PrimaryKey, Result, CORES_DIR_NAME, PRIMARY_KEY_FILE_NAME};
@@ -121,19 +120,19 @@ impl StorageKind {
     /// The core is writable if the provide `PartialKeypair.secret.is_some()`.
     /// NB: A core should be controlled by only **one** store. This is insured by [`Corestore`]
     /// acceses this. Maybe we should also add a lock file.
-    pub async fn get_core_from_key_pair(&self, kp: PartialKeypair) -> Result<ReplicatingCore> {
+    pub async fn get_core_from_key_pair(&self, kp: PartialKeypair) -> Result<Hypercore> {
         match self {
             StorageKind::Mem => {
                 let s = Storage::new_memory().await?;
                 let hc = HypercoreBuilder::new(s).key_pair(kp).build().await?;
-                Ok(ReplicatingCore::from(hc))
+                Ok(hc)
             }
             StorageKind::Disk(path) => {
                 let path_to_storage = get_storage_root(&kp);
                 let full_path = path.join(path_to_storage);
                 let s = Storage::new_disk(&full_path, false).await?;
                 let hc = HypercoreBuilder::new(s).key_pair(kp).build().await?;
-                Ok(ReplicatingCore::from(hc))
+                Ok(hc)
             }
         }
     }
@@ -175,7 +174,7 @@ impl StorageKind {
         })
     }
 
-    pub async fn load_existing_cores(&self) -> Result<Vec<ReplicatingCore>> {
+    pub async fn load_existing_cores(&self) -> Result<Vec<Hypercore>> {
         match self {
             StorageKind::Mem => Ok(vec![]),
             StorageKind::Disk(path) => {
@@ -184,8 +183,7 @@ impl StorageKind {
                 for core_path in get_all_core_dirs(cores_dir_path) {
                     let s = Storage::new_disk(&core_path, false).await?;
                     let hc = HypercoreBuilder::new(s).build().await?;
-                    let core = ReplicatingCore::from(hc);
-                    out.push(core);
+                    out.push(hc);
                 }
                 Ok(out)
             }

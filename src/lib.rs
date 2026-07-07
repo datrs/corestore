@@ -13,20 +13,12 @@ mod builder;
 mod keys;
 mod storage;
 use delegate::delegate;
-use futures_lite::{AsyncRead, AsyncWrite};
-use hypercore_protocol::{discovery_key, DiscoveryKey, Event, ProtocolBuilder};
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use hypercore_protocol::{discovery_key, DiscoveryKey};
+use std::{collections::HashMap, sync::Arc};
 use storage::StorageKind;
-use tokio::{
-    spawn,
-    sync::RwLock,
-    time::{sleep, timeout},
-};
-use tracing::{debug, error, warn};
+use tokio::sync::RwLock;
 
-use hypercore::{replication::CoreMethodsError, HypercoreError, VerifyingKey};
-
-use replicator::{on_peer, ProtoMethods, ReplicatingCore, ReplicatorError};
+use hypercore::{replication::CoreMethodsError, Hypercore, HypercoreError, VerifyingKey};
 
 pub use builder::{CorestoreBuilder, CorestoreBuilderError};
 
@@ -46,8 +38,6 @@ pub type Namespace = [u8; 32];
 pub enum Error {
     #[error("error from hypercore: {0}")]
     Hypercore(#[from] HypercoreError),
-    #[error("error from ReplicatingCore: {0}")]
-    ReplicatingCore(#[from] ReplicatorError),
     #[error("error from hypercore CoreMethods: {0}")]
     CoreMethods(#[from] CoreMethodsError),
     #[error("Signature error")]
@@ -120,23 +110,19 @@ pub use events::Event as CorestoreEvents;
 
 #[derive(Debug, Default)]
 struct CoreCache {
-    verifying_key_to_cores: HashMap<VerifyingKey, ReplicatingCore>,
+    verifying_key_to_cores: HashMap<VerifyingKey, Hypercore>,
 }
 
 impl CoreCache {
     // get the dk from a name
-    fn insert(
-        &mut self,
-        verifying_key: &VerifyingKey,
-        core: ReplicatingCore,
-    ) -> Option<ReplicatingCore> {
+    fn insert(&mut self, verifying_key: &VerifyingKey, core: Hypercore) -> Option<Hypercore> {
         self.verifying_key_to_cores.insert(*verifying_key, core)
     }
 
     fn verifying_keys(&self) -> Vec<&VerifyingKey> {
         self.verifying_key_to_cores.keys().collect()
     }
-    fn get(&self, verifying_key: &VerifyingKey) -> Option<ReplicatingCore> {
+    fn get(&self, verifying_key: &VerifyingKey) -> Option<Hypercore> {
         self.verifying_key_to_cores.get(verifying_key).cloned()
     }
 
@@ -168,9 +154,9 @@ impl Corestore {
         }
         to self.corestore.write().await {
             /// Get a core from it's [`VerifyingKey`].
-            pub async fn get_from_verifying_key(&self, vk: &VerifyingKey) -> Result<ReplicatingCore>;
+            pub async fn get_from_verifying_key(&self, vk: &VerifyingKey) -> Result<Hypercore>;
             /// Get a hypercore by name. If the core does not exist, create it.
-            pub async fn get_from_name(&self, name: &str) -> Result<ReplicatingCore>;
+            pub async fn get_from_name(&self, name: &str) -> Result<Hypercore>;
         }
     }
     /// Create a new [`Corestore`] that stores it data in RAM
@@ -182,108 +168,14 @@ impl Corestore {
             .expect("should always work")
     }
 
-    /// Start replicating through the given stream
-    pub async fn replicate<S: AsyncRead + AsyncWrite + Send + Sync + Unpin + 'static>(
-        &self,
-        stream: S,
-        is_initiator: bool,
-    ) -> Result<()> {
-        let mut rx = self.corestore.read().await.subscribe();
-        let protocol = ProtocolBuilder::new(is_initiator).connect(stream);
-        let protocol: Arc<RwLock<Box<dyn ProtoMethods>>> =
-            Arc::new(RwLock::new(Box::new(protocol)));
-
-        let cs = self.clone();
-        let events_protocol = protocol.clone();
-        spawn(async move {
-            use CorestoreEvents::*;
-            // TODO i think this is only needed in the protocol read loop
-            loop {
-                match timeout(Duration::from_millis(250), rx.recv()).await {
-                    Err(_timed_out) => {
-                        sleep(Duration::from_millis(250)).await;
-                    }
-                    Ok(Ok(CoreAdded(verifying_key))) => {
-                        if is_initiator {
-                            events_protocol
-                                .write()
-                                .await
-                                .open(*verifying_key.as_bytes())
-                                .await?;
-                        }
-                    }
-                    Ok(Ok(Shutdown)) => return Ok::<(), Error>(()),
-                    Ok(_) => continue,
-                }
-            }
-        });
-        spawn(async move {
-            loop {
-                let event_fut = async { protocol.write().await._next().await };
-                if let Ok(Some(Ok(event))) = timeout(Duration::from_millis(500), event_fut).await {
-                    debug!("RX Protocol event: [{event:?}]");
-                    match event {
-                        Event::Handshake(_m) => {
-                            // TODO associate a "name" with this stream and log it.
-                            if is_initiator {
-                                // TODO spawn this?
-                                for vk in cs.corestore.read().await.verifying_keys() {
-                                    protocol.write().await.open(*vk.as_bytes()).await?;
-                                }
-                            }
-                            debug!("Handshake complete. Session secured")
-                        }
-                        Event::DiscoveryKey(dk) => {
-                            if let Some(vk) = cs.verifying_key_from_discovery_key(&dk).await {
-                                protocol.write().await.open(*vk.as_bytes()).await?;
-                            }
-                        }
-                        Event::Channel(channel) => {
-                            // this channel is only opened after protocol.open(..) verifies we have the
-                            // same pub key.. Correct?
-                            //
-                            // get the core associated with this channel's dk.
-                            let Some(vk) = cs
-                                .verifying_key_from_discovery_key(channel.discovery_key())
-                                .await
-                            else {
-                                panic!(
-                            "We **should** have verified that we have a core with this &dk already"
-                        );
-                            };
-                            // get core replicating over the channel...
-                            let core = cs.get_from_verifying_key(&vk).await?;
-                            // pass channel to peers to replicate
-                            let _ = core
-                                .add_peer(
-                                    core.core.clone(),
-                                    protocol.clone() as Arc<RwLock<Box<dyn ProtoMethods>>>,
-                                )
-                                .await;
-                            on_peer(core.core.clone(), channel).await?;
-                        }
-                        Event::Close(_dkey) => {}
-                        _ => break,
-                    }
-                } else {
-                    sleep(Duration::from_millis(250)).await;
-                }
-            }
-            Ok::<(), Error>(())
-        });
-        Ok(())
-    }
+    // TODO: multi-core replication (multiplexing several Hypercores' channels over one
+    // connection, as JS corestore's `.replicate()` does) is not implemented yet. It needs to be
+    // rebuilt on top of `core/`'s native `hypercore_protocol`-based replication rather than the
+    // old `replicator` crate's `ReplicatingCore`/`ProtoMethods` model.
 }
 
 #[cfg(test)]
 mod test {
-
-    use std::time::Duration;
-
-    use hypercore::replication::{CoreInfo, CoreMethods};
-    use replicator::utils::create_connected_streams;
-    use tokio::time::sleep;
-
     use super::{storage::get_storage_root, *};
 
     const TEST_PK: PrimaryKey = [
@@ -308,7 +200,7 @@ mod test {
         let hc = cs.get_from_name("foo").await?;
         hc.append(b"hello").await?;
         assert_eq!(hc.get(0).await?, Some(b"hello".to_vec()));
-        let vk = hc.key_pair().await.public;
+        let vk = hc.key_pair().public;
 
         let core_path = storage_dir.path().join(get_storage_root(&vk));
         assert!(core_path.exists());
@@ -355,69 +247,6 @@ mod test {
             ));
         }
 
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn prexisting_cores_replicate() -> Result<()> {
-        let (cs_a, cs_b) = (Corestore::new_mem().await, Corestore::new_mem().await);
-        let (a, b) = create_connected_streams();
-        let name = "foo";
-        let core_a = cs_a.get_from_name(name).await?;
-        let pk = core_a.key_pair().await.public;
-        let core_b = cs_b.get_from_verifying_key(&pk).await?;
-
-        core_a.append(b"hello").await?;
-        assert!(core_b.get(0).await?.is_none());
-
-        cs_a.replicate(a, false).await?;
-        cs_b.replicate(b, true).await?;
-        loop {
-            if core_b.get(0).await?.is_some() {
-                break;
-            }
-            sleep(Duration::from_millis(25)).await;
-        }
-        Ok(())
-    }
-
-    // TODO NEXT I need to add a way for CorestoreInner  to emit an event whenever it gets a new
-    // Hypercore. Then have Corestore run Protocol.open(new_hypercore.public_key).
-    #[tokio::test]
-    async fn new_cores_replicate() -> Result<()> {
-        let (cs_a, cs_b) = (Corestore::new_mem().await, Corestore::new_mem().await);
-        let (a, b) = create_connected_streams();
-
-        utils::log();
-        cs_a.replicate(a, false).await?;
-        cs_b.replicate(b, true).await?;
-
-        // wait a bit so handshake completes
-        sleep(Duration::from_millis(25)).await;
-
-        let name = "foo";
-        let core_a = cs_a.get_from_name(name).await?;
-        dbg!(core_a.append(b"hello").await?);
-
-        let pk = core_a.key_pair().await.public;
-        let core_b = cs_b.get_from_verifying_key(&pk).await?;
-
-        core_a.append(b"world").await?;
-        loop {
-            if let Some(x) = core_b.get(0).await? {
-                assert_eq!(x, b"hello");
-                break;
-            }
-            dbg!();
-            sleep(Duration::from_millis(500)).await;
-        }
-        loop {
-            if let Some(x) = core_b.get(1).await? {
-                assert_eq!(x, b"world");
-                break;
-            }
-            sleep(Duration::from_millis(25)).await;
-        }
         Ok(())
     }
 }
