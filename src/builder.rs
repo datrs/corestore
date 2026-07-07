@@ -62,7 +62,7 @@ impl InnerCorstore {
     delegate! {
         to self.core_cache {
             pub fn verifying_key_from_discovery_key(&self, dk: &DiscoveryKey) -> Option<VerifyingKey>;
-            pub fn verifying_keys(&self) -> Vec<&VerifyingKey>;
+            pub fn verifying_keys(&self) -> Vec<VerifyingKey>;
         }
         to self.events {
             pub fn subscribe(&self) -> Receiver<Event>;

@@ -16,7 +16,10 @@ signature = "2.2.0"
 rand = "0.8.5"
 derive_builder = "0.20.2"
 futures-lite = "2.3.0"
+futures = "0.3"
+tokio-stream = { version = "0.1", features = ["sync"] }
 delegate = "0.13.1"
+hypercore_handshake = "0.6.0"
 
 [dependencies.hypercore]
 path = "../core"
@@ -24,8 +27,10 @@ default-features = false
 features = ["sparse", "replication"]
 
 [dependencies.hypercore-protocol]
-version = "0.7.1"
+path = "../protocol"
 
 [dev-dependencies]
 rusty_nodejs_repl = "0.2.1"
 tempfile = "3.10.0"
+tokio-util = { version = "0.7", features = ["compat"] }
+uint24le_framing = "0.2.0"

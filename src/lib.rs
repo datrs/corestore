@@ -11,6 +11,7 @@
 
 mod builder;
 mod keys;
+mod replicate;
 mod storage;
 use delegate::delegate;
 use hypercore_protocol::{discovery_key, DiscoveryKey};
@@ -19,8 +20,10 @@ use storage::StorageKind;
 use tokio::sync::RwLock;
 
 use hypercore::{replication::CoreMethodsError, Hypercore, HypercoreError, VerifyingKey};
+use hypercore_handshake::CipherTrait;
 
 pub use builder::{CorestoreBuilder, CorestoreBuilderError};
+pub use replicate::CorestoreConnection;
 
 static MAX_EVENT_QUEUE_CAPACITY: usize = 32;
 const CORES_DIR_NAME: &str = "cores";
@@ -119,8 +122,8 @@ impl CoreCache {
         self.verifying_key_to_cores.insert(*verifying_key, core)
     }
 
-    fn verifying_keys(&self) -> Vec<&VerifyingKey> {
-        self.verifying_key_to_cores.keys().collect()
+    fn verifying_keys(&self) -> Vec<VerifyingKey> {
+        self.verifying_key_to_cores.keys().copied().collect()
     }
     fn get(&self, verifying_key: &VerifyingKey) -> Option<Hypercore> {
         self.verifying_key_to_cores.get(verifying_key).cloned()
@@ -168,15 +171,75 @@ impl Corestore {
             .expect("should always work")
     }
 
-    // TODO: multi-core replication (multiplexing several Hypercores' channels over one
-    // connection, as JS corestore's `.replicate()` does) is not implemented yet. It needs to be
-    // rebuilt on top of `core/`'s native `hypercore_protocol`-based replication rather than the
-    // old `replicator` crate's `ReplicatingCore`/`ProtoMethods` model.
+    /// Non-blocking snapshot of all currently known verifying keys. Returns an empty `Vec`
+    /// if the store is momentarily locked. Used by [`CorestoreConnection`] to
+    /// opportunistically attach cores added to the store after it was created.
+    pub(crate) fn try_verifying_keys(&self) -> Vec<VerifyingKey> {
+        self.corestore
+            .try_read()
+            .map(|guard| guard.verifying_keys())
+            .unwrap_or_default()
+    }
+
+    /// Non-blocking lookup of the [`VerifyingKey`] for a [`DiscoveryKey`]. See
+    /// [`Corestore::verifying_key_from_discovery_key`] for the async version.
+    pub(crate) fn try_verifying_key_from_discovery_key(
+        &self,
+        dk: &DiscoveryKey,
+    ) -> Option<VerifyingKey> {
+        self.corestore
+            .try_read()
+            .ok()
+            .and_then(|guard| guard.verifying_key_from_discovery_key(dk))
+    }
+
+    /// Non-blocking subscription to [`CorestoreEvents::CoreAdded`], used by
+    /// [`CorestoreConnection`] to wake itself and re-check for newly-opened cores rather
+    /// than relying entirely on incidental protocol activity to trigger another poll.
+    /// Returns `None` if the store is momentarily locked; the caller retries later.
+    pub(crate) fn try_subscribe(&self) -> Option<tokio::sync::broadcast::Receiver<CorestoreEvents>> {
+        self.corestore.try_read().ok().map(|guard| guard.subscribe())
+    }
+
+    /// Start replicating every core in this store over `stream`, multiplexed via one
+    /// `hypercore_protocol` connection — mirrors JS corestore's `.replicate()`
+    /// (`corestore/index.js:481`). Poll (or `.await`) the returned [`CorestoreConnection`]
+    /// to drive it. Cores opened in this store *after* this is called are still attached
+    /// automatically, the next time the connection is polled.
+    pub fn replicate(&self, stream: impl CipherTrait + 'static) -> CorestoreConnection {
+        CorestoreConnection::new(self.clone(), stream)
+    }
 }
 
 #[cfg(test)]
 mod test {
     use super::{storage::get_storage_root, *};
+    use hypercore_handshake::{
+        state_machine::{hc_specific::generate_keypair, SecStream},
+        Cipher,
+    };
+    use std::time::Duration;
+    use tokio::time::sleep;
+    use tokio_util::compat::TokioAsyncReadCompatExt;
+    use uint24le_framing::Uint24LELengthPrefixedFraming;
+
+    /// Create a pair of connected in-memory encrypted streams, mirroring the same helper in
+    /// `bee`/`hrss`'s tests.
+    fn create_connected_streams() -> (impl CipherTrait + 'static, impl CipherTrait + 'static) {
+        let (a_b, b_a) = tokio::io::duplex(64 * 1024);
+        let a_b = Uint24LELengthPrefixedFraming::new(a_b.compat());
+        let b_a = Uint24LELengthPrefixedFraming::new(b_a.compat());
+        let keypair = generate_keypair().unwrap();
+        let initiator = Cipher::new(
+            Some(Box::new(a_b)),
+            SecStream::new_initiator_xx(&[]).unwrap().into(),
+        );
+        let responder = Cipher::new(
+            Some(Box::new(b_a)),
+            SecStream::new_responder_xx(&keypair, &[]).unwrap().into(),
+        );
+        (initiator, responder)
+    }
 
     const TEST_PK: PrimaryKey = [
         124, 229, 174, 223, 232, 201, 160, 10, 235, 143, 37, 249, 107, 92, 35, 125, 68, 246, 2,
@@ -247,6 +310,94 @@ mod test {
             ));
         }
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn prexisting_cores_replicate() -> Result<()> {
+        let (cs_a, cs_b) = (Corestore::new_mem().await, Corestore::new_mem().await);
+        let (a, b) = create_connected_streams();
+        let name = "foo";
+        let core_a = cs_a.get_from_name(name).await?;
+        let vk = core_a.key_pair().public;
+        let core_b = cs_b.get_from_verifying_key(&vk).await?;
+
+        core_a.append(b"hello").await?;
+        assert!(core_b.get(0).await?.is_none());
+
+        tokio::spawn(cs_a.replicate(a));
+        tokio::spawn(cs_b.replicate(b));
+
+        loop {
+            if core_b.get(0).await?.is_some() {
+                break;
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn new_cores_replicate() -> Result<()> {
+        let (cs_a, cs_b) = (Corestore::new_mem().await, Corestore::new_mem().await);
+        let (a, b) = create_connected_streams();
+
+        // No cores exist in either store yet: this proves cores opened *after* replicate()
+        // is called still get attached (`CorestoreConnection::open_new_cores`), not just
+        // ones that existed up front.
+        tokio::spawn(cs_a.replicate(a));
+        tokio::spawn(cs_b.replicate(b));
+
+        let name = "foo";
+        let core_a = cs_a.get_from_name(name).await?;
+        core_a.append(b"hello").await?;
+
+        let vk = core_a.key_pair().public;
+        let core_b = cs_b.get_from_verifying_key(&vk).await?;
+
+        core_a.append(b"world").await?;
+        loop {
+            if let Some(x) = core_b.get(0).await? {
+                assert_eq!(x, b"hello");
+                break;
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
+        loop {
+            if let Some(x) = core_b.get(1).await? {
+                assert_eq!(x, b"world");
+                break;
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn multiple_cores_multiplex_over_one_connection() -> Result<()> {
+        let (cs_a, cs_b) = (Corestore::new_mem().await, Corestore::new_mem().await);
+        let (a, b) = create_connected_streams();
+
+        let foo_a = cs_a.get_from_name("foo").await?;
+        let bar_a = cs_a.get_from_name("bar").await?;
+        foo_a.append(b"foo hello").await?;
+        bar_a.append(b"bar hello").await?;
+
+        let foo_b = cs_b.get_from_verifying_key(&foo_a.key_pair().public).await?;
+        let bar_b = cs_b.get_from_verifying_key(&bar_a.key_pair().public).await?;
+
+        // Only one connection for both cores.
+        tokio::spawn(cs_a.replicate(a));
+        tokio::spawn(cs_b.replicate(b));
+
+        loop {
+            if foo_b.get(0).await?.is_some() && bar_b.get(0).await?.is_some() {
+                break;
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(foo_b.get(0).await?, Some(b"foo hello".to_vec()));
+        assert_eq!(bar_b.get(0).await?, Some(b"bar hello".to_vec()));
         Ok(())
     }
 }
