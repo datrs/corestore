@@ -22,7 +22,7 @@ delegate = "0.13.1"
 hypercore_handshake = "0.6.0"
 
 [dependencies.hypercore]
-path = "../core"
+version = "0.17.0-alpha.1"
 default-features = false
 features = ["sparse", "replication"]
 
