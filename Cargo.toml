@@ -27,7 +27,7 @@ default-features = false
 features = ["sparse", "replication"]
 
 [dependencies.hypercore-protocol]
-path = "../protocol"
+version = "0.7.2"
 
 [dev-dependencies]
 rusty_nodejs_repl = "0.2.1"
