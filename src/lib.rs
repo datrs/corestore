@@ -171,6 +171,23 @@ impl Corestore {
             .expect("should always work")
     }
 
+    /// Create a new [`Corestore`] that stores its data on disk under `path`, creating the
+    /// directory if it does not exist. Reopening the same `path` restores the store's primary
+    /// key and every core previously written there, so named cores keep their identity across
+    /// restarts.
+    ///
+    /// Unlike [`Corestore::new_mem`] this can fail, because it touches the filesystem.
+    pub async fn new_disk(path: impl AsRef<std::path::Path>) -> Result<Corestore> {
+        let path = path.as_ref();
+        // Creating a store at a path that does not exist yet is the common case, and the
+        // primary-key write below fails with a bare `NotFound` without this.
+        std::fs::create_dir_all(path).map_err(hypercore::HypercoreError::from)?;
+        CorestoreBuilder::default()
+            .storage(StorageKind::new_disk(path))
+            .build()
+            .await
+    }
+
     /// Non-blocking snapshot of all currently known verifying keys. Returns an empty `Vec`
     /// if the store is momentarily locked. Used by [`CorestoreConnection`] to
     /// opportunistically attach cores added to the store after it was created.
@@ -222,6 +239,29 @@ mod test {
     use tokio::time::sleep;
     use tokio_util::compat::TokioAsyncReadCompatExt;
     use uint24le_framing::Uint24LELengthPrefixedFraming;
+
+    /// A disk-backed store reopened from the same path keeps its primary key, so a named
+    /// core resolves to the same public key and its data is still there. This is the whole
+    /// point of `new_disk`, and it is what lets a publisher keep its feed id across restarts.
+    #[tokio::test]
+    async fn new_disk_round_trips_a_named_core() -> Result<()> {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // A path that does not exist yet: the usual case for a fresh store.
+        let dir = tmp.path().join("store");
+
+        let key = {
+            let store = Corestore::new_disk(&dir).await?;
+            let core = store.get_from_name("feed").await?;
+            core.append(b"hello").await?;
+            core.key_pair().public
+        };
+
+        let store = Corestore::new_disk(&dir).await?;
+        let core = store.get_from_name("feed").await?;
+        assert_eq!(core.key_pair().public, key, "named core changed identity");
+        assert_eq!(core.get(0).await?.as_deref(), Some(&b"hello"[..]));
+        Ok(())
+    }
 
     /// Create a pair of connected in-memory encrypted streams, mirroring the same helper in
     /// `bee`/`hrss`'s tests.
