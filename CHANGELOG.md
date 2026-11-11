@@ -13,6 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+### Fixed
+
+- A core opened after `Corestore::replicate` could fail to attach to that connection, so it never replicated over it.
+
 ### Removed
 
 <!-- next-url -->

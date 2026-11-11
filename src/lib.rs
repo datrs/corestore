@@ -80,8 +80,8 @@ mod events {
         Shutdown,
     }
 
-    #[derive(Debug)]
-    /// Event bus for Corestore
+    #[derive(Debug, Clone)]
+    /// Event bus for Corestore. Clones send to the same subscribers.
     pub struct Events {
         channel: broadcast::Sender<Event>,
     }
@@ -146,6 +146,9 @@ impl CoreCache {
 pub struct Corestore {
     ///  shared ref to corestore
     corestore: Arc<RwLock<builder::InnerCorstore>>,
+    /// The same event bus the inner store sends on, kept outside its lock so subscribing never
+    /// waits for, or misses events because of, a store operation in progress.
+    events: events::Events,
 }
 
 impl Corestore {
@@ -154,6 +157,9 @@ impl Corestore {
             #[await(false)]
             /// Get the [`VerifyingKey`] key that corresponds to a [`DiscoveryKey`]
             pub async fn verifying_key_from_discovery_key(&self, dk: &DiscoveryKey) -> Option<VerifyingKey>;
+            #[await(false)]
+            /// The [`VerifyingKey`]s of every core in the store.
+            pub(crate) async fn verifying_keys(&self) -> Vec<VerifyingKey>;
         }
         to self.corestore.write().await {
             /// Get a core from it's [`VerifyingKey`].
@@ -188,41 +194,16 @@ impl Corestore {
             .await
     }
 
-    /// Non-blocking snapshot of all currently known verifying keys. Returns an empty `Vec`
-    /// if the store is momentarily locked. Used by [`CorestoreConnection`] to
-    /// opportunistically attach cores added to the store after it was created.
-    pub(crate) fn try_verifying_keys(&self) -> Vec<VerifyingKey> {
-        self.corestore
-            .try_read()
-            .map(|guard| guard.verifying_keys())
-            .unwrap_or_default()
-    }
-
-    /// Non-blocking lookup of the [`VerifyingKey`] for a [`DiscoveryKey`]. See
-    /// [`Corestore::verifying_key_from_discovery_key`] for the async version.
-    pub(crate) fn try_verifying_key_from_discovery_key(
-        &self,
-        dk: &DiscoveryKey,
-    ) -> Option<VerifyingKey> {
-        self.corestore
-            .try_read()
-            .ok()
-            .and_then(|guard| guard.verifying_key_from_discovery_key(dk))
-    }
-
-    /// Non-blocking subscription to [`CorestoreEvents::CoreAdded`], used by
-    /// [`CorestoreConnection`] to wake itself and re-check for newly-opened cores rather
-    /// than relying entirely on incidental protocol activity to trigger another poll.
-    /// Returns `None` if the store is momentarily locked; the caller retries later.
-    pub(crate) fn try_subscribe(&self) -> Option<tokio::sync::broadcast::Receiver<CorestoreEvents>> {
-        self.corestore.try_read().ok().map(|guard| guard.subscribe())
+    /// Subscribe to [`CorestoreEvents`], such as a core being added. Never waits on the store.
+    pub(crate) fn subscribe(&self) -> tokio::sync::broadcast::Receiver<CorestoreEvents> {
+        self.events.subscribe()
     }
 
     /// Start replicating every core in this store over `stream`, multiplexed via one
     /// `hypercore_protocol` connection — mirrors JS corestore's `.replicate()`
     /// (`corestore/index.js:481`). Poll (or `.await`) the returned [`CorestoreConnection`]
-    /// to drive it. Cores opened in this store *after* this is called are still attached
-    /// automatically, the next time the connection is polled.
+    /// to drive it. Cores opened in this store *after* this is called are attached as soon as
+    /// they are added.
     pub fn replicate(&self, stream: impl CipherTrait + 'static) -> CorestoreConnection {
         CorestoreConnection::new(self.clone(), stream)
     }
@@ -383,7 +364,7 @@ mod test {
         let (a, b) = create_connected_streams();
 
         // No cores exist in either store yet: this proves cores opened *after* replicate()
-        // is called still get attached (`CorestoreConnection::open_new_cores`), not just
+        // is called still get attached (from their `CoreAdded` events), not just
         // ones that existed up front.
         tokio::spawn(cs_a.replicate(a));
         tokio::spawn(cs_b.replicate(b));
@@ -410,6 +391,63 @@ mod test {
             }
             sleep(Duration::from_millis(25)).await;
         }
+        Ok(())
+    }
+
+    /// `hrss`'s reader opens its feed cores after the connection is running, once it has read
+    /// their keys from a bootstrap core. A core is added under the store's write lock, and the
+    /// connection task can wake on its `CoreAdded` while that lock is still held. Its
+    /// non-blocking lookups then found nothing, the wakeup was used up, and nothing woke it
+    /// again: the core never got a channel. Seen as a subscriber that connects but never sees a
+    /// feed item, in about 1 run in 10.
+    #[tokio::test]
+    async fn a_core_added_while_the_connection_finds_the_store_locked_still_replicates(
+    ) -> Result<()> {
+        let (cs_a, cs_b) = (Corestore::new_mem().await, Corestore::new_mem().await);
+        let (a, b) = create_connected_streams();
+
+        // A core both sides have from the start, standing in for `hrss`'s keys core.
+        let bootstrap_a = cs_a.get_from_name("bootstrap").await?;
+        bootstrap_a.append(b"bootstrap").await?;
+        let bootstrap_b = cs_b
+            .get_from_verifying_key(&bootstrap_a.key_pair().public)
+            .await?;
+        let late_a = cs_a.get_from_name("late").await?;
+        late_a.append(b"late hello").await?;
+
+        tokio::spawn(cs_a.replicate(a));
+        tokio::spawn(cs_b.replicate(b));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while bootstrap_b.get(0).await?.is_none() {
+                sleep(Duration::from_millis(25)).await;
+            }
+            Ok::<(), Error>(())
+        })
+        .await
+        .expect("the bootstrap core should replicate")?;
+
+        // Add the late core the way `get_from_verifying_key` does, but keep holding the lock
+        // long enough for the connection task to wake on `CoreAdded` and find it locked.
+        let late_b = {
+            let mut locked = cs_b.corestore.write().await;
+            let core = locked
+                .get_from_verifying_key(&late_a.key_pair().public)
+                .await?;
+            sleep(Duration::from_millis(200)).await;
+            core
+        };
+
+        let replicated = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(block) = late_b.get(0).await? {
+                    return Ok::<_, Error>(block);
+                }
+                sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("a core added while the store was locked should still get a channel")?;
+        assert_eq!(replicated, b"late hello");
         Ok(())
     }
 

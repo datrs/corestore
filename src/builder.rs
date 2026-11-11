@@ -10,7 +10,7 @@ use crate::{
     CoreCache, Corestore, Error, PrimaryKey, Result,
 };
 use hypercore::{PartialKeypair, VerifyingKey};
-use tokio::sync::{broadcast::Receiver, RwLock};
+use tokio::sync::RwLock;
 
 #[derive(Debug, derive_builder::Builder)]
 #[builder(
@@ -42,11 +42,12 @@ impl CorestoreBuilder {
         };
         // Somewhat complicated primary key logic
         let primary_key: PrimaryKey = storage.get_or_create_primary_key(&self.primary_key)?;
+        let events = Events::default();
         let mut cs = InnerCorstore {
             primary_key,
             storage,
             core_cache: self.core_cache.unwrap_or_default(),
-            events: Default::default(),
+            events: events.clone(),
         };
         for existing_core in cs.storage.load_existing_cores().await? {
             let vk = existing_core.key_pair().public;
@@ -54,6 +55,7 @@ impl CorestoreBuilder {
         }
         Ok(Corestore {
             corestore: Arc::new(RwLock::new(cs)),
+            events,
         })
     }
 }
@@ -64,16 +66,9 @@ impl InnerCorstore {
             pub fn verifying_key_from_discovery_key(&self, dk: &DiscoveryKey) -> Option<VerifyingKey>;
             pub fn verifying_keys(&self) -> Vec<VerifyingKey>;
         }
-        to self.events {
-            pub fn subscribe(&self) -> Receiver<Event>;
-        }
     }
 
-    fn insert_core_into_cache(
-        &mut self,
-        vk: VerifyingKey,
-        core: Hypercore,
-    ) -> Option<Hypercore> {
+    fn insert_core_into_cache(&mut self, vk: VerifyingKey, core: Hypercore) -> Option<Hypercore> {
         self.core_cache.insert(&vk, core.clone())
     }
 

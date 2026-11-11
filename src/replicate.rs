@@ -14,25 +14,29 @@ use std::{
     task::{Context, Poll},
 };
 
-use futures::{Stream, stream::FuturesUnordered};
+use futures::{stream::FuturesUnordered, Stream};
 use hypercore::VerifyingKey;
 use hypercore_handshake::CipherTrait;
 use hypercore_protocol::{Event, Protocol};
-use tokio_stream::wrappers::BroadcastStream;
+use tokio_stream::wrappers::{errors::BroadcastStreamRecvError, BroadcastStream};
 use tracing::{trace, warn};
 
 use crate::{Corestore, CorestoreEvents, Error};
 
 type BoxIoFuture = Pin<Box<dyn Future<Output = io::Result<()>> + Send>>;
 type BoxAttachFuture = Pin<Box<dyn Future<Output = Result<(), Error>> + Send>>;
+type BoxKeysFuture = Pin<Box<dyn Future<Output = Vec<VerifyingKey>> + Send>>;
 
 /// Drives replication for every core in a [`Corestore`] over one physical connection.
 ///
-/// Every core currently in the store is attached up front. Cores opened later (via
-/// [`Corestore::get_from_name`]/[`Corestore::get_from_verifying_key`]) are attached the next
-/// time this is polled; a core the *remote* peer opens that we also have locally is attached
-/// as soon as its `DiscoveryKey` announcement arrives. Resolves once the underlying
-/// connection closes.
+/// Every core in the store is attached once the handshake completes. Cores opened later (via
+/// [`Corestore::get_from_name`]/[`Corestore::get_from_verifying_key`]) are attached as soon as
+/// they are added, and a core the *remote* peer opens that we also have locally as soon as its
+/// `DiscoveryKey` announcement arrives. Resolves once the underlying connection closes.
+///
+/// Nothing here gives up on a locked store: every lookup waits for the lock. Skipping a lookup
+/// while a core was being added used to lose that core for good, since the wakeup that would
+/// have retried it had already been used.
 pub struct CorestoreConnection {
     store: Corestore,
     protocol: Protocol,
@@ -40,7 +44,10 @@ pub struct CorestoreConnection {
     opened: HashSet<VerifyingKey>,
     pending_opens: FuturesUnordered<BoxIoFuture>,
     active: FuturesUnordered<BoxAttachFuture>,
-    core_added: Option<BroadcastStream<CorestoreEvents>>,
+    /// Lookups in the store for keys to open on this connection.
+    key_lookups: FuturesUnordered<BoxKeysFuture>,
+    /// The store's events, subscribed to as soon as this connection exists.
+    store_events: BroadcastStream<CorestoreEvents>,
 }
 
 impl std::fmt::Debug for CorestoreConnection {
@@ -54,6 +61,7 @@ impl std::fmt::Debug for CorestoreConnection {
 
 impl CorestoreConnection {
     pub(crate) fn new(store: Corestore, stream: impl CipherTrait + 'static) -> Self {
+        let store_events = BroadcastStream::new(store.subscribe());
         Self {
             store,
             protocol: Protocol::new(Box::new(stream)),
@@ -61,33 +69,41 @@ impl CorestoreConnection {
             opened: HashSet::new(),
             pending_opens: FuturesUnordered::new(),
             active: FuturesUnordered::new(),
-            core_added: None,
+            key_lookups: FuturesUnordered::new(),
+            store_events,
         }
     }
 
-    /// Subscribe to the store's `CoreAdded` events if not already subscribed, so a core opened
-    /// well after this connection is running (e.g. once a caller learns a key via some other
-    /// bootstrap core) wakes this task immediately instead of waiting for incidental protocol
-    /// activity to trigger another poll. Retries later if the store is momentarily locked.
-    fn ensure_subscribed(&mut self) {
-        if self.core_added.is_none() {
-            self.core_added = self.store.try_subscribe().map(BroadcastStream::new);
+    /// Open a channel for the core with this key, unless this connection already has one.
+    fn open_core(&mut self, vk: VerifyingKey) {
+        if self.opened.insert(vk) {
+            trace!(?vk, "corestore: opening channel for core");
+            self.pending_opens
+                .push(Box::pin(self.protocol.open(vk.to_bytes())));
         }
     }
 
-    /// Call `protocol.open()` for every core in the store we haven't already opened on this
-    /// connection. Non-blocking: skips cores if the store is momentarily locked, and picks
-    /// them up on a later poll instead. A no-op until the handshake completes — `Protocol`
-    /// can't send `Open` messages before then (mirrors `core/`'s `ConnectionReplicator`,
-    /// which only calls `.open()` in reaction to `Handshake`/`DiscoveryKey` events).
-    fn open_new_cores(&mut self) {
+    /// Look up every core in the store and open the ones this connection doesn't have yet.
+    fn open_every_core(&mut self) {
+        let store = self.store.clone();
+        self.key_lookups
+            .push(Box::pin(async move { store.verifying_keys().await }));
+    }
+
+    fn on_store_event(&mut self, event: Result<CorestoreEvents, BroadcastStreamRecvError>) {
+        // Before the handshake there is nothing to open on; the handshake opens every core.
         if !self.handshake_done {
             return;
         }
-        for vk in self.store.try_verifying_keys() {
-            if self.opened.insert(vk) {
-                trace!(?vk, "corestore: opening channel for core");
-                self.pending_opens.push(Box::pin(self.protocol.open(vk.to_bytes())));
+        match event {
+            Ok(CorestoreEvents::CoreAdded(vk)) => self.open_core(vk),
+            Ok(CorestoreEvents::Shutdown) => {}
+            Err(BroadcastStreamRecvError::Lagged(missed)) => {
+                warn!(
+                    missed,
+                    "corestore: missed store events, rechecking every core"
+                );
+                self.open_every_core();
             }
         }
     }
@@ -96,17 +112,20 @@ impl CorestoreConnection {
         match event {
             Event::Handshake(_) => {
                 self.handshake_done = true;
-                self.open_new_cores();
+                self.open_every_core();
             }
             Event::DiscoveryKey(dk) => {
                 // The remote opened a channel for a core we may have locally but haven't
                 // opened on this connection yet (e.g. we only just learned this key
                 // ourselves via a `keys`-core-style discovery flow).
-                if let Some(vk) = self.store.try_verifying_key_from_discovery_key(&dk) {
-                    if self.opened.insert(vk) {
-                        self.pending_opens.push(Box::pin(self.protocol.open(vk.to_bytes())));
-                    }
-                }
+                let store = self.store.clone();
+                self.key_lookups.push(Box::pin(async move {
+                    store
+                        .verifying_key_from_discovery_key(&dk)
+                        .await
+                        .into_iter()
+                        .collect()
+                }));
             }
             Event::Channel(channel) => {
                 let dk = *channel.discovery_key();
@@ -141,26 +160,17 @@ impl Future for CorestoreConnection {
         loop {
             let mut progressed = false;
 
-            this.ensure_subscribed();
+            // This connection's `Corestore` holds a sender, so the stream never ends.
+            while let Poll::Ready(Some(event)) = Pin::new(&mut this.store_events).poll_next(cx) {
+                this.on_store_event(event);
+                progressed = true;
+            }
 
-            // Opportunistically attach any core opened in the store since we last checked.
-            this.open_new_cores();
-
-            // Drain `CoreAdded` notifications. We don't need the event's contents — just
-            // draining wakes this task promptly when a new core appears (rather than only on
-            // incidental protocol activity), and `open_new_cores` above/next pass does the
-            // actual attaching.
-            if let Some(rx) = &mut this.core_added {
-                loop {
-                    match Pin::new(&mut *rx).poll_next(cx) {
-                        Poll::Ready(Some(_)) => progressed = true,
-                        Poll::Ready(None) => {
-                            this.core_added = None;
-                            break;
-                        }
-                        Poll::Pending => break,
-                    }
+            while let Poll::Ready(Some(keys)) = Pin::new(&mut this.key_lookups).poll_next(cx) {
+                for vk in keys {
+                    this.open_core(vk);
                 }
+                progressed = true;
             }
 
             loop {
