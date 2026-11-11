@@ -13,13 +13,18 @@ mod builder;
 mod keys;
 mod replicate;
 mod storage;
-use delegate::delegate;
+use futures::future::{BoxFuture, FutureExt, Shared};
 use hypercore_protocol::{discovery_key, DiscoveryKey};
-use std::{collections::HashMap, sync::Arc};
+use keys::{key_pair_from_name, DEFAULT_NAMESPACE};
+use std::{
+    collections::HashMap,
+    sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard},
+};
 use storage::StorageKind;
-use tokio::sync::RwLock;
 
-use hypercore::{replication::CoreMethodsError, Hypercore, HypercoreError, VerifyingKey};
+use hypercore::{
+    replication::CoreMethodsError, Hypercore, HypercoreError, PartialKeypair, VerifyingKey,
+};
 use hypercore_handshake::CipherTrait;
 
 pub use builder::{CorestoreBuilder, CorestoreBuilderError};
@@ -59,6 +64,10 @@ pub enum Error {
     LibSodiumSignSeedKeypair(i32),
     #[error("error reading dirs {0}")]
     ReadDirError(std::io::Error),
+    /// Opening a core failed. Everyone who asked for the core while it was opening gets the
+    /// same error, so it is shared.
+    #[error("error opening core: {0}")]
+    Opening(Arc<Error>),
 }
 
 type Result<T> = std::result::Result<T, Error>;
@@ -111,32 +120,62 @@ mod events {
 
 pub use events::Event as CorestoreEvents;
 
+/// A core being created, shared by everyone who asks for it before it is ready.
+type OpeningCore = Shared<BoxFuture<'static, std::result::Result<Hypercore, Arc<Error>>>>;
+
+#[derive(Clone)]
+enum CachedCore {
+    Ready(Hypercore),
+    Opening(OpeningCore),
+}
+
+impl std::fmt::Debug for CachedCore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CachedCore::Ready(core) => f.debug_tuple("Ready").field(core).finish(),
+            CachedCore::Opening(_) => write!(f, "Opening"),
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct CoreCache {
-    verifying_key_to_cores: HashMap<VerifyingKey, Hypercore>,
+    verifying_key_to_cores: HashMap<VerifyingKey, CachedCore>,
 }
 
 impl CoreCache {
-    // get the dk from a name
-    fn insert(&mut self, verifying_key: &VerifyingKey, core: Hypercore) -> Option<Hypercore> {
-        self.verifying_key_to_cores.insert(*verifying_key, core)
+    fn get(&self, verifying_key: &VerifyingKey) -> Option<CachedCore> {
+        self.verifying_key_to_cores.get(verifying_key).cloned()
     }
 
-    fn verifying_keys(&self) -> Vec<VerifyingKey> {
-        self.verifying_key_to_cores.keys().copied().collect()
+    fn insert_ready(&mut self, verifying_key: VerifyingKey, core: Hypercore) {
+        self.verifying_key_to_cores
+            .insert(verifying_key, CachedCore::Ready(core));
     }
-    fn get(&self, verifying_key: &VerifyingKey) -> Option<Hypercore> {
-        self.verifying_key_to_cores.get(verifying_key).cloned()
+
+    fn insert_opening(&mut self, verifying_key: VerifyingKey, opening: OpeningCore) {
+        self.verifying_key_to_cores
+            .insert(verifying_key, CachedCore::Opening(opening));
+    }
+
+    fn remove(&mut self, verifying_key: &VerifyingKey) {
+        self.verifying_key_to_cores.remove(verifying_key);
+    }
+
+    /// The keys of every core that has finished opening.
+    fn verifying_keys(&self) -> Vec<VerifyingKey> {
+        self.verifying_key_to_cores
+            .iter()
+            .filter(|(_, cached)| matches!(cached, CachedCore::Ready(_)))
+            .map(|(vk, _)| *vk)
+            .collect()
     }
 
     /// TODO make this O(1) by storing a dk -> vk map
     fn verifying_key_from_discovery_key(&self, dk: &DiscoveryKey) -> Option<VerifyingKey> {
-        for vk in self.verifying_key_to_cores.keys() {
-            if dk == &discovery_key(vk.as_bytes()) {
-                return Some(*vk);
-            }
-        }
-        None
+        self.verifying_keys()
+            .into_iter()
+            .find(|vk| dk == &discovery_key(vk.as_bytes()))
     }
 }
 
@@ -152,22 +191,97 @@ pub struct Corestore {
 }
 
 impl Corestore {
-    delegate! {
-        to self.corestore.read().await {
-            #[await(false)]
-            /// Get the [`VerifyingKey`] key that corresponds to a [`DiscoveryKey`]
-            pub async fn verifying_key_from_discovery_key(&self, dk: &DiscoveryKey) -> Option<VerifyingKey>;
-            #[await(false)]
-            /// The [`VerifyingKey`]s of every core in the store.
-            pub(crate) async fn verifying_keys(&self) -> Vec<VerifyingKey>;
-        }
-        to self.corestore.write().await {
-            /// Get a core from it's [`VerifyingKey`].
-            pub async fn get_from_verifying_key(&self, vk: &VerifyingKey) -> Result<Hypercore>;
-            /// Get a hypercore by name. If the core does not exist, create it.
-            pub async fn get_from_name(&self, name: &str) -> Result<Hypercore>;
-        }
+    fn read(&self) -> RwLockReadGuard<'_, builder::InnerCorstore> {
+        self.corestore.read().expect("corestore lock poisoned")
     }
+
+    fn write(&self) -> RwLockWriteGuard<'_, builder::InnerCorstore> {
+        self.corestore.write().expect("corestore lock poisoned")
+    }
+
+    /// Get the [`VerifyingKey`] that corresponds to a [`DiscoveryKey`], among the cores that
+    /// have finished opening.
+    pub fn verifying_key_from_discovery_key(&self, dk: &DiscoveryKey) -> Option<VerifyingKey> {
+        self.read().verifying_key_from_discovery_key(dk)
+    }
+
+    /// The [`VerifyingKey`]s of every core that has finished opening.
+    pub(crate) fn verifying_keys(&self) -> Vec<VerifyingKey> {
+        self.read().verifying_keys()
+    }
+
+    /// Get a hypercore by name. If the core does not exist, create it.
+    pub async fn get_from_name(&self, name: &str) -> Result<Hypercore> {
+        let primary_key = self.read().primary_key();
+        let key_pair = key_pair_from_name(primary_key, &DEFAULT_NAMESPACE, name)?;
+        self.get_core(key_pair).await
+    }
+
+    /// Get a core from its [`VerifyingKey`]. With no secret key, it is read-only.
+    pub async fn get_from_verifying_key(&self, verifying_key: &VerifyingKey) -> Result<Hypercore> {
+        self.get_core(PartialKeypair {
+            public: *verifying_key,
+            secret: None,
+        })
+        .await
+    }
+
+    /// Get the core for `key_pair`, creating it if needed. Callers asking for a core that is
+    /// already being created wait on that same creation, so a key never gets two cores, and
+    /// the lock is never held while a core is being created.
+    async fn get_core(&self, key_pair: PartialKeypair) -> Result<Hypercore> {
+        let verifying_key = key_pair.public;
+        let opening = {
+            let mut inner = self.write();
+            match inner.core_cache.get(&verifying_key) {
+                Some(CachedCore::Ready(core)) => return Ok(core),
+                Some(CachedCore::Opening(opening)) => opening,
+                None => {
+                    let storage = inner.storage().clone();
+                    let opening = async move {
+                        storage
+                            .get_core_from_key_pair(key_pair)
+                            .await
+                            .map_err(Arc::new)
+                    }
+                    .boxed()
+                    .shared();
+                    inner
+                        .core_cache
+                        .insert_opening(verifying_key, opening.clone());
+                    opening
+                }
+            }
+        };
+
+        let opened = opening.clone().await;
+
+        // Whoever finishes first settles the entry. Leave it alone if it has already changed.
+        let newly_ready = {
+            let mut inner = self.write();
+            let still_opening = matches!(
+                inner.core_cache.get(&verifying_key),
+                Some(CachedCore::Opening(current)) if current.ptr_eq(&opening)
+            );
+            match &opened {
+                Ok(core) if still_opening => {
+                    inner.core_cache.insert_ready(verifying_key, core.clone());
+                    true
+                }
+                // Forget the failure, so asking again retries.
+                Err(_) if still_opening => {
+                    inner.core_cache.remove(&verifying_key);
+                    false
+                }
+                _ => false,
+            }
+        };
+        if newly_ready {
+            let _ = self.events.send(CorestoreEvents::CoreAdded(verifying_key));
+        }
+        opened.map_err(Error::Opening)
+    }
+
     /// Create a new [`Corestore`] that stores it data in RAM
     pub async fn new_mem() -> Corestore {
         CorestoreBuilder::default()
@@ -394,15 +508,13 @@ mod test {
         Ok(())
     }
 
-    /// `hrss`'s reader opens its feed cores after the connection is running, once it has read
-    /// their keys from a bootstrap core. A core is added under the store's write lock, and the
-    /// connection task can wake on its `CoreAdded` while that lock is still held. Its
-    /// non-blocking lookups then found nothing, the wakeup was used up, and nothing woke it
-    /// again: the core never got a channel. Seen as a subscriber that connects but never sees a
-    /// feed item, in about 1 run in 10.
+    /// `hrss`'s reader opens its feed cores after the connection is running and quiet, once it
+    /// has read their keys from a bootstrap core. The connection used to wake on `CoreAdded`
+    /// while the store was still locked, find nothing with its non-blocking lookups, and never
+    /// be woken again, so the core never got a channel. That can't happen now, since the event
+    /// carries the key and lookups don't fail, but the scenario is what has to keep working.
     #[tokio::test]
-    async fn a_core_added_while_the_connection_finds_the_store_locked_still_replicates(
-    ) -> Result<()> {
+    async fn a_core_opened_after_the_connection_goes_quiet_replicates() -> Result<()> {
         let (cs_a, cs_b) = (Corestore::new_mem().await, Corestore::new_mem().await);
         let (a, b) = create_connected_streams();
 
@@ -426,16 +538,9 @@ mod test {
         .await
         .expect("the bootstrap core should replicate")?;
 
-        // Add the late core the way `get_from_verifying_key` does, but keep holding the lock
-        // long enough for the connection task to wake on `CoreAdded` and find it locked.
-        let late_b = {
-            let mut locked = cs_b.corestore.write().await;
-            let core = locked
-                .get_from_verifying_key(&late_a.key_pair().public)
-                .await?;
-            sleep(Duration::from_millis(200)).await;
-            core
-        };
+        let late_b = cs_b
+            .get_from_verifying_key(&late_a.key_pair().public)
+            .await?;
 
         let replicated = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
@@ -446,8 +551,66 @@ mod test {
             }
         })
         .await
-        .expect("a core added while the store was locked should still get a channel")?;
+        .expect("a core opened late should still get a channel")?;
         assert_eq!(replicated, b"late hello");
+        Ok(())
+    }
+
+    /// Two callers opening the same new key at once must share one core. Two cores for one
+    /// key would mean two writers on the same storage. On disk, because creating an in-memory
+    /// core never yields, so two opens of one would never overlap.
+    #[tokio::test]
+    async fn concurrent_opens_of_one_key_share_one_core() -> Result<()> {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = Corestore::new_disk(tmp.path()).await?;
+
+        let (first, second) =
+            tokio::join!(store.get_from_name("feed"), store.get_from_name("feed"));
+        let (first, second) = (first?, second?);
+        first.append(b"hello").await?;
+
+        assert_eq!(second.info().length, 1, "both handles are the same core");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn concurrent_opens_announce_the_core_once() -> Result<()> {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = Corestore::new_disk(tmp.path()).await?;
+        let mut events = store.subscribe();
+
+        let (first, second) =
+            tokio::join!(store.get_from_name("feed"), store.get_from_name("feed"));
+        let vk = first?.key_pair().public;
+        second?;
+
+        assert!(matches!(events.try_recv(), Ok(CorestoreEvents::CoreAdded(added)) if added == vk));
+        assert!(events.try_recv().is_err(), "announced only once");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_failed_open_can_be_retried() -> Result<()> {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = Corestore::new_disk(tmp.path()).await?;
+        let key_pair = key_pair_from_name(store.read().primary_key(), &DEFAULT_NAMESPACE, "feed")?;
+        // A file where the core's storage directory should go.
+        let blocker = tmp.path().join(get_storage_root(&key_pair));
+        std::fs::create_dir_all(blocker.parent().unwrap()).unwrap();
+        std::fs::write(&blocker, b"not a directory").unwrap();
+
+        assert!(matches!(
+            store.get_from_name("feed").await,
+            Err(Error::Opening(_))
+        ));
+        assert!(
+            store.read().core_cache.get(&key_pair.public).is_none(),
+            "a failure is not cached"
+        );
+
+        std::fs::remove_file(&blocker).unwrap();
+        let core = store.get_from_name("feed").await?;
+        assert_eq!(core.key_pair().public, key_pair.public);
         Ok(())
     }
 

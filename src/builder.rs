@@ -3,14 +3,9 @@ use hypercore::Hypercore;
 use hypercore_protocol::DiscoveryKey;
 use std::sync::Arc;
 
-use crate::{
-    events::{Event, Events},
-    keys::{key_pair_from_name, DEFAULT_NAMESPACE},
-    storage::StorageKind,
-    CoreCache, Corestore, Error, PrimaryKey, Result,
-};
-use hypercore::{PartialKeypair, VerifyingKey};
-use tokio::sync::RwLock;
+use crate::{events::Events, storage::StorageKind, CoreCache, Corestore, Error, PrimaryKey};
+use hypercore::VerifyingKey;
+use std::sync::RwLock;
 
 #[derive(Debug, derive_builder::Builder)]
 #[builder(
@@ -28,10 +23,7 @@ pub struct InnerCorstore {
     storage: StorageKind,
     #[builder(default = "Default::default()")]
     /// The place we keep active cores
-    core_cache: CoreCache,
-    /// Emits store events for replication
-    #[builder(default = "Default::default()")]
-    events: Events,
+    pub(crate) core_cache: CoreCache,
 }
 
 impl CorestoreBuilder {
@@ -47,7 +39,6 @@ impl CorestoreBuilder {
             primary_key,
             storage,
             core_cache: self.core_cache.unwrap_or_default(),
-            events: events.clone(),
         };
         for existing_core in cs.storage.load_existing_cores().await? {
             let vk = existing_core.key_pair().public;
@@ -68,43 +59,15 @@ impl InnerCorstore {
         }
     }
 
-    fn insert_core_into_cache(&mut self, vk: VerifyingKey, core: Hypercore) -> Option<Hypercore> {
-        self.core_cache.insert(&vk, core.clone())
+    fn insert_core_into_cache(&mut self, vk: VerifyingKey, core: Hypercore) {
+        self.core_cache.insert_ready(vk, core)
     }
 
-    /// Get a hypercore by name. If the core does not exist, create it.
-    /// This does... not? work if there is no verifying key.
-    /// Or, maybe, all cores get a primary key, but only writable cores use this?
-    /// This would imply that a corestore instance could have mixed readable and writable keys...
-    pub async fn get_from_name(&mut self, name: &str) -> Result<Hypercore> {
-        let kp = key_pair_from_name(self.primary_key, &DEFAULT_NAMESPACE, name)?;
-
-        if let Some(core) = self.core_cache.get(&kp.public) {
-            return Ok(core);
-        };
-        let core = self.storage.get_core_from_key_pair(kp.clone()).await?;
-        self.core_cache.insert(&kp.public, core.clone());
-        let _ = self.events.send(Event::CoreAdded(kp.public));
-        Ok(core)
+    pub(crate) fn primary_key(&self) -> PrimaryKey {
+        self.primary_key
     }
 
-    /// Get a core from it's [`VerifyingKey`].
-    /// Since the core only has a verifyin key (and no [`SigningKey`]). It is read-only.
-    pub async fn get_from_verifying_key(
-        &mut self,
-        verifying_key: &VerifyingKey,
-    ) -> Result<Hypercore> {
-        if let Some(core) = self.core_cache.get(verifying_key) {
-            return Ok(core);
-        };
-        let kp = PartialKeypair {
-            public: *verifying_key,
-            secret: None,
-        };
-        let core = self.storage.get_core_from_key_pair(kp.clone()).await?;
-        self.core_cache.insert(&kp.public, core.clone());
-        // TODO dry this
-        let _ = self.events.send(Event::CoreAdded(kp.public));
-        Ok(core)
+    pub(crate) fn storage(&self) -> &StorageKind {
+        &self.storage
     }
 }

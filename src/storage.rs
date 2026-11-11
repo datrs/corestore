@@ -96,7 +96,7 @@ impl From<&PartialKeypair> for StorageId {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 /// The kind of [`Storage`] backing the [`Corestore`]
 pub enum StorageKind {
     /// Use RAM
