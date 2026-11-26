@@ -34,3 +34,7 @@ rusty_nodejs_repl = "0.2.1"
 tempfile = "3.10.0"
 tokio-util = { version = "0.7", features = ["compat"] }
 uint24le_framing = "0.2.0"
+
+# The local core, for `Hypercore::get_with_options` (unreleased). Drop once it is released.
+[patch.crates-io]
+hypercore = { path = "../core" }

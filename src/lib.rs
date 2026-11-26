@@ -326,14 +326,26 @@ impl Corestore {
 #[cfg(test)]
 mod test {
     use super::{storage::get_storage_root, *};
+    use hypercore::GetOptions;
     use hypercore_handshake::{
         state_machine::{hc_specific::generate_keypair, SecStream},
         Cipher,
     };
     use std::time::Duration;
-    use tokio::time::sleep;
     use tokio_util::compat::TokioAsyncReadCompatExt;
     use uint24le_framing::Uint24LELengthPrefixedFraming;
+
+    /// How long a test waits for a block to replicate before failing.
+    const REPLICATION_BUDGET: Duration = Duration::from_secs(5);
+
+    /// Read block `index` of `core`, waiting for replication to deliver it. A `get` waits even
+    /// before any channel is attached, so this also covers a core that has yet to get one.
+    async fn replicated_block(core: &Hypercore, index: u64) -> Result<Vec<u8>> {
+        let block = core
+            .get_with_options(index, GetOptions::with_timeout(REPLICATION_BUDGET))
+            .await?;
+        Ok(block.expect("a waiting get resolves with the block, never None"))
+    }
 
     /// A disk-backed store reopened from the same path keeps its primary key, so a named
     /// core resolves to the same public key and its data is still there. This is the whole
@@ -458,17 +470,15 @@ mod test {
         let core_b = cs_b.get_from_verifying_key(&vk).await?;
 
         core_a.append(b"hello").await?;
-        assert!(core_b.get(0).await?.is_none());
+        let before_replicating = core_b
+            .get_with_options(0, GetOptions::without_waiting())
+            .await?;
+        assert!(before_replicating.is_none());
 
         tokio::spawn(cs_a.replicate(a));
         tokio::spawn(cs_b.replicate(b));
 
-        loop {
-            if core_b.get(0).await?.is_some() {
-                break;
-            }
-            sleep(Duration::from_millis(25)).await;
-        }
+        assert_eq!(replicated_block(&core_b, 0).await?, b"hello");
         Ok(())
     }
 
@@ -491,20 +501,8 @@ mod test {
         let core_b = cs_b.get_from_verifying_key(&vk).await?;
 
         core_a.append(b"world").await?;
-        loop {
-            if let Some(x) = core_b.get(0).await? {
-                assert_eq!(x, b"hello");
-                break;
-            }
-            sleep(Duration::from_millis(25)).await;
-        }
-        loop {
-            if let Some(x) = core_b.get(1).await? {
-                assert_eq!(x, b"world");
-                break;
-            }
-            sleep(Duration::from_millis(25)).await;
-        }
+        assert_eq!(replicated_block(&core_b, 0).await?, b"hello");
+        assert_eq!(replicated_block(&core_b, 1).await?, b"world");
         Ok(())
     }
 
@@ -529,30 +527,14 @@ mod test {
 
         tokio::spawn(cs_a.replicate(a));
         tokio::spawn(cs_b.replicate(b));
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while bootstrap_b.get(0).await?.is_none() {
-                sleep(Duration::from_millis(25)).await;
-            }
-            Ok::<(), Error>(())
-        })
-        .await
-        .expect("the bootstrap core should replicate")?;
+        assert_eq!(replicated_block(&bootstrap_b, 0).await?, b"bootstrap");
 
         let late_b = cs_b
             .get_from_verifying_key(&late_a.key_pair().public)
             .await?;
 
-        let replicated = tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                if let Some(block) = late_b.get(0).await? {
-                    return Ok::<_, Error>(block);
-                }
-                sleep(Duration::from_millis(25)).await;
-            }
-        })
-        .await
-        .expect("a core opened late should still get a channel")?;
-        assert_eq!(replicated, b"late hello");
+        // Times out if the late core never gets a channel.
+        assert_eq!(replicated_block(&late_b, 0).await?, b"late hello");
         Ok(())
     }
 
@@ -631,14 +613,8 @@ mod test {
         tokio::spawn(cs_a.replicate(a));
         tokio::spawn(cs_b.replicate(b));
 
-        loop {
-            if foo_b.get(0).await?.is_some() && bar_b.get(0).await?.is_some() {
-                break;
-            }
-            sleep(Duration::from_millis(25)).await;
-        }
-        assert_eq!(foo_b.get(0).await?, Some(b"foo hello".to_vec()));
-        assert_eq!(bar_b.get(0).await?, Some(b"bar hello".to_vec()));
+        assert_eq!(replicated_block(&foo_b, 0).await?, b"foo hello");
+        assert_eq!(replicated_block(&bar_b, 0).await?, b"bar hello");
         Ok(())
     }
 }
