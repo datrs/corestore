@@ -24,7 +24,7 @@ hypercore_handshake = "0.6.0"
 [dependencies.hypercore]
 version = "0.17.0-alpha.1"
 default-features = false
-features = ["sparse", "replication"]
+features = ["sparse"]
 
 [dependencies.hypercore-protocol]
 version = "0.7.2"
